@@ -1,0 +1,7 @@
+
+config SIM_DETECT
+	bool "Sim card detect"	
+	default y
+	help
+	  Say Y here if you want to detect sim card.
+

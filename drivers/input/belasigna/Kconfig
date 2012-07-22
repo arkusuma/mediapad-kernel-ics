@@ -1,0 +1,7 @@
+config BELASIGNA_BS300
+#
+	tristate "BELASIGNA BS300 AUDIO"	
+#
+	depends on I2C_QUP
+	help
+	  Say Y here if you have the BELASIGNA BS300. 

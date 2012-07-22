@@ -1,0 +1,18 @@
+#
+# Miscellaneous I2C chip drivers configuration
+#
+# *** DEPRECATED! Do not add new entries! See Makefile ***
+#
+
+menu "Miscellaneous I2C Chip support"
+
+
+#/* <BU5D07680 liujinggang 20100413 begin */
+config S7_FEATURE_SENSORS_ST_LSM303DLH
+	tristate "LSM303DLH is a 6D sensors(gs&ms)"
+	default n
+	help
+	 The LSM303DLH is a system-in-package featuring a 3D
+	 digital linear acceleration sensor and a 3D digital magnetic sensor.
+#/* BU5D07680 liujinggang 20100413 end> */
+endmenu
