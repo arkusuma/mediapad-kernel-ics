@@ -1250,10 +1250,15 @@ static void t1320_work_reset_func(struct work_struct *work)
 	}
 }
 
-#define FILTER_RADIUS 50
+static inline int prev_index(struct f11_finger_data *finger)
+{
+	return (finger->sample_index ? finger->sample_index : FILTER_SIZE) - 1;
+}
 
 static void t1320_add_sample(struct f11_finger_data *finger, int status, int x, int y, int z, int wx, int wy)
 {
+	int i;
+
 	if (z == 0)
 		status = 0;
 
@@ -1266,62 +1271,62 @@ static void t1320_add_sample(struct f11_finger_data *finger, int status, int x, 
 		finger->sample_count = 0;
 		finger->reported = 0;
 		finger->is_wide = 0;
+		finger->x_sum = 0;
+		finger->y_sum = 0;
+		finger->z_sum = 0;
 	}
 
 	// Record touch sample
 	if (status) {
-		finger->xs[finger->sample_index] = x;
-		finger->ys[finger->sample_index] = y;
-		finger->zs[finger->sample_index] = z;
-		if (++finger->sample_index >= FILTER_SIZE)
-			finger->sample_index = 0;
-		if (finger->sample_count < FILTER_SIZE)
-			++finger->sample_count;
 
 		// Check for wide swipe
-		if (finger->sample_count > 1) {
+		if (finger->sample_count > 0) {
 			int dx, dy;
-			int prev = finger->sample_index - 2;
-			if (prev < 0)
-				prev += FILTER_SIZE;
-			dx = x - finger->xs[prev];
-			dy = y - finger->ys[prev];
+			i = prev_index(finger);
+			dx = x - finger->x[i];
+			dy = y - finger->y[i];
 			finger->is_wide = (dx * dx + dy * dy > FILTER_RADIUS * FILTER_RADIUS);
+			printk(KERN_INFO "(%d, %d, %d)", x, y, dx * dx + dy * dy);
+		} else {
+			printk(KERN_INFO "(%d, %d)", x, y);
 		}
-	}
-}
 
-static void t1320_mean_filter(struct f11_finger_data *finger)
-{
-	int i, xsum = 0, ysum = 0, zsum = 0;
-	for (i = 0; i < finger->sample_count; i++) {
-		int index = finger->sample_index - i - 1;
-		if (index < 0)
-			index += FILTER_SIZE;
-		xsum += finger->xs[index];
-		ysum += finger->ys[index];
-		zsum += finger->zs[index];
+		i = finger->sample_index;
+		if (finger->sample_count >= FILTER_SIZE) {
+			finger->x_sum -= finger->x[i];
+			finger->y_sum -= finger->y[i];
+			finger->z_sum -= finger->z[i];
+		}
+
+		finger->x[i] = x;
+		finger->y[i] = y;
+		finger->z[i] = z;
+
+		finger->x_sum += x;
+		finger->y_sum += y;
+		finger->z_sum += z;
+
+		finger->sample_index = i + 1 < FILTER_SIZE ? i + 1 : 0;
+		if (finger->sample_count < FILTER_SIZE)
+			++finger->sample_count;
 	}
-	finger->x = xsum / i;
-	finger->y = ysum / i;
-	finger->z = zsum / i;
 }
 
 static void t1320_report_finger(struct t1320 *ts, struct f11_finger_data *finger)
 {
-	if ((finger->status && 
-				(finger->reported || finger->sample_count >= FILTER_SIZE))
-		 	|| (finger->prev_status && !finger->reported)) {
-		t1320_mean_filter(finger);
-
-		printk(KERN_INFO "(%d, %d, %d)", finger->x, finger->y, finger->z);
+	if ((finger->status && (finger->reported || finger->sample_count >= FILTER_SIZE))
+			|| (finger->prev_status && !finger->status && !finger->reported)) {
+		int count = finger->sample_count;
+		int x = finger->x_sum / count;
+		int y = finger->y_sum / count;
+		int z = finger->z_sum / count;
 
 #ifdef CONFIG_SYNA_MT
-		input_report_abs(ts->input_dev, ABS_MT_POSITION_X, finger->x);
-		input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, finger->y);
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, y);
 		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, VALUE_ABS_MT_TOUCH_MAJOR);
 		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, VALUE_ABS_MT_TOUCH_MINOR);
-		input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, finger->z / 2);
+		input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, z / 2);
 #endif
 
 #ifdef CONFIG_SYNA_MULTIFINGER
@@ -1355,29 +1360,36 @@ static void t1320_process_touch(struct t1320 *ts)
 			struct f11_finger_data *finger = &ts->f11_fingers[f];
 			if (finger->is_wide) {
 				// Report old touch data
-				int orig_index = finger->sample_index;
-				if (--finger->sample_index < 0)
-					finger->sample_index += FILTER_SIZE;
+				int i = prev_index(finger);
+				finger->x_sum -= finger->x[i];
+				finger->y_sum -= finger->y[i];
+				finger->z_sum -= finger->z[i];
+				finger->sample_index = i;
 				finger->sample_count--;
-				finger->reported = 1;
-				t1320_report_finger(ts, finger);
-				finger->sample_index = orig_index;
-			} else {
-				t1320_report_finger(ts, finger);
+				finger->reported = 1; // Force report
 			}
+			t1320_report_finger(ts, finger);
 		}
 		input_sync(ts->input_dev);
 	}
 
 	for (f = 0; f < ts->f11.points_supported; ++f) {
 		struct f11_finger_data *finger = &ts->f11_fingers[f];
-		if (finger->is_wide)
+		// Discard old data on wide swipe
+		if (finger->is_wide) {
+			int i = prev_index(finger);
+			finger->x_sum = finger->x[i];
+			finger->y_sum = finger->y[i];
+			finger->z_sum = finger->z[i];
 			finger->sample_count = 1;
-		t1320_report_finger(ts, finger);
-		if (finger->prev_status && !finger->status) {
-			touch_up = 1;
-			finger->prev_status = 0;
 		}
+		if (finger->prev_status && !finger->status && !finger->reported)
+			touch_up = 1;
+
+		t1320_report_finger(ts, finger);
+
+		if (finger->prev_status && !finger->status)
+			finger->prev_status = 0;
 	}
 	input_sync(ts->input_dev);
 

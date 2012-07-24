@@ -47,22 +47,23 @@ enum f11_finger_status {
 	f11_finger_inaccurate = 2,
 };
 
-#define FILTER_SIZE 4
+#define FILTER_SIZE    4
+#define FILTER_RADIUS 50
 
 struct f11_finger_data {
 	enum f11_finger_status status;
 	enum f11_finger_status prev_status;
 
-	u12 x;
-	u12 y;
-	u8 z;
-
 	unsigned int speed;
 	bool active;
 
-	u12 xs[FILTER_SIZE];
-	u12 ys[FILTER_SIZE];
-	u8 zs[FILTER_SIZE];
+	u12 x[FILTER_SIZE];
+	u12 y[FILTER_SIZE];
+	u8 z[FILTER_SIZE];
+
+	int x_sum;
+	int y_sum;
+	int z_sum;
 
 	int sample_index;
 	int sample_count;
