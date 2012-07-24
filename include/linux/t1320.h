@@ -56,8 +56,8 @@ enum f11_finger_status {
  * FILTER_RADIUS and FILTER_MIN_MOVE are specified as touchscreen unit,
  * squared.
  */
-#define FILTER_RADIUS   559 /* (10 pixels * 2.365)^2 */
-#define FILTER_MIN_MOVE   6 /* (1 pixel * 2.365)^2 */
+#define FILTER_RADIUS   2237 /* (20 pixels * 2.365)^2 */
+#define FILTER_MIN_MOVE   12 /* (1.5 pixels * 2.365)^2 */
 
 struct f11_finger_data {
 	enum f11_finger_status status;
