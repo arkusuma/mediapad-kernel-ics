@@ -942,32 +942,6 @@ void poweron_touchscreen(void){
   }
  
 #endif
-static void ts_update_pen_state(struct t1320 *ts, int x, int y, int pressure, int wx, int wy)
-{
-
-	if (pressure) {
-#ifdef CONFIG_SYNA_MT
-		input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);
-        input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, y);
-		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, VALUE_ABS_MT_TOUCH_MAJOR/*max(wx, wy)*/);
-		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, VALUE_ABS_MT_TOUCH_MINOR/*min(wx, wy)*/);
-		input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, pressure/2);
-        input_mt_sync(ts->input_dev);
-#endif
-	} else {
-#ifdef CONFIG_DEBUG_T1320_FIRMWARE
-	ts_debug_X =x ;
-	ts_debug_Y = y ;
-	if(debug_level >= 1)
-		printk("x=%d,y=%d\n",ts_debug_X,ts_debug_Y);
-#endif
-        /* begin: modify by liyaobing 2011/1/6 */
-#ifdef CONFIG_SYNA_MT
-		input_mt_sync(ts->input_dev);
-#endif
-        /* end: modify by liyaobing 2011/1/6 */
-	}
-}
 
 static int t1320_read_pdt(struct t1320 *ts)
 {
@@ -1057,8 +1031,6 @@ static int t1320_read_pdt(struct t1320 *ts)
 
 				ts->f11_fingers = kcalloc(ts->f11.points_supported,
 				                          sizeof(*ts->f11_fingers), 0);
-				memset(ts->f11_fingers, 0, 
-					ts->f11.points_supported * sizeof(*ts->f11_fingers));
 				ts->f11_has_gestures = (query[1] >> 5) & 1;
 				ts->f11_has_relative = (query[1] >> 3) & 1;
 
@@ -1277,6 +1249,148 @@ static void t1320_work_reset_func(struct work_struct *work)
 		power_reset_cnt = 0 ;
 	}
 }
+
+#define FILTER_RADIUS 50
+
+static void t1320_add_sample(struct f11_finger_data *finger, int status, int x, int y, int z, int wx, int wy)
+{
+	if (z == 0)
+		status = 0;
+
+	finger->prev_status = finger->status;
+	finger->status = status;
+
+	// Reset sample on new touch
+	if (!finger->prev_status && status) {
+		finger->sample_index = 0;
+		finger->sample_count = 0;
+		finger->reported = 0;
+		finger->is_wide = 0;
+	}
+
+	// Record touch sample
+	if (status) {
+		finger->xs[finger->sample_index] = x;
+		finger->ys[finger->sample_index] = y;
+		finger->zs[finger->sample_index] = z;
+		if (++finger->sample_index >= FILTER_SIZE)
+			finger->sample_index = 0;
+		if (finger->sample_count < FILTER_SIZE)
+			++finger->sample_count;
+
+		// Check for wide swipe
+		if (finger->sample_count > 1) {
+			int dx, dy;
+			int prev = finger->sample_index - 2;
+			if (prev < 0)
+				prev += FILTER_SIZE;
+			dx = x - finger->xs[prev];
+			dy = y - finger->ys[prev];
+			finger->is_wide = (dx * dx + dy * dy > FILTER_RADIUS * FILTER_RADIUS);
+		}
+	}
+}
+
+static void t1320_mean_filter(struct f11_finger_data *finger)
+{
+	int i, xsum = 0, ysum = 0, zsum = 0;
+	for (i = 0; i < finger->sample_count; i++) {
+		int index = finger->sample_index - i - 1;
+		if (index < 0)
+			index += FILTER_SIZE;
+		xsum += finger->xs[index];
+		ysum += finger->ys[index];
+		zsum += finger->zs[index];
+	}
+	finger->x = xsum / i;
+	finger->y = ysum / i;
+	finger->z = zsum / i;
+}
+
+static void t1320_report_finger(struct t1320 *ts, struct f11_finger_data *finger)
+{
+	if ((finger->status && 
+				(finger->reported || finger->sample_count >= FILTER_SIZE))
+		 	|| (finger->prev_status && !finger->reported)) {
+		t1320_mean_filter(finger);
+
+		printk(KERN_INFO "(%d, %d, %d)", finger->x, finger->y, finger->z);
+
+#ifdef CONFIG_SYNA_MT
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_X, finger->x);
+		input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, finger->y);
+		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, VALUE_ABS_MT_TOUCH_MAJOR);
+		input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, VALUE_ABS_MT_TOUCH_MINOR);
+		input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, finger->z / 2);
+#endif
+
+#ifdef CONFIG_SYNA_MULTIFINGER
+		/* Report multiple fingers for software prior to 2.6.31 - not standard - uses special input.h */
+		input_report_abs(ts->input_dev, ABS_X_FINGER(f), x);
+		input_report_abs(ts->input_dev, ABS_Y_FINGER(f), y);
+		input_report_abs(ts->input_dev, ABS_Z_FINGER(f), z);
+#endif
+
+		finger->reported = 1;
+	}
+
+#ifdef CONFIG_SYNA_MT
+	input_mt_sync(ts->input_dev);
+#endif
+}
+
+static void t1320_process_touch(struct t1320 *ts)
+{
+	int f, unreported_wide_swipe = 0, touch_up = 0;
+	for (f = 0; f < ts->f11.points_supported; ++f) {
+		struct f11_finger_data *finger = &ts->f11_fingers[f];
+		if (finger->is_wide && !finger->reported) {
+			unreported_wide_swipe = 1;
+			break;
+		}
+	}
+
+	if (unreported_wide_swipe) {
+		for (f = 0; f < ts->f11.points_supported; ++f) {
+			struct f11_finger_data *finger = &ts->f11_fingers[f];
+			if (finger->is_wide) {
+				// Report old touch data
+				int orig_index = finger->sample_index;
+				if (--finger->sample_index < 0)
+					finger->sample_index += FILTER_SIZE;
+				finger->sample_count--;
+				finger->reported = 1;
+				t1320_report_finger(ts, finger);
+				finger->sample_index = orig_index;
+			} else {
+				t1320_report_finger(ts, finger);
+			}
+		}
+		input_sync(ts->input_dev);
+	}
+
+	for (f = 0; f < ts->f11.points_supported; ++f) {
+		struct f11_finger_data *finger = &ts->f11_fingers[f];
+		if (finger->is_wide)
+			finger->sample_count = 1;
+		t1320_report_finger(ts, finger);
+		if (finger->prev_status && !finger->status) {
+			touch_up = 1;
+			finger->prev_status = 0;
+		}
+	}
+	input_sync(ts->input_dev);
+
+	// Process once again on touch up event
+	if (touch_up) {
+		for (f = 0; f < ts->f11.points_supported; ++f) {
+			struct f11_finger_data *finger = &ts->f11_fingers[f];
+			t1320_report_finger(ts, finger);
+		}
+		input_sync(ts->input_dev);
+	}
+}
+
 extern bool g_screen_touch_event;
 static void t1320_work_func(struct work_struct *work)
 {
@@ -1284,15 +1398,14 @@ static void t1320_work_func(struct work_struct *work)
 	u32 z = 0;
 	u32 wx = 0, wy = 0;
 	u32 x = 0, y = 0;
-	u8 prev_status;
-	
+
 	struct t1320 *ts = container_of(work,struct t1320, work);
-    
+
 	g_screen_touch_event = true;
-    
-      /*disable power reset when process point report*/
-      power_reset_enable = 0 ;
-	
+
+	/*disable power reset when process point report*/
+	power_reset_enable = 0 ;
+
 	ret = i2c_transfer(ts->client->adapter, ts->data_i2c_msg, 2);
 
 	if (ret < 0) {
@@ -1304,92 +1417,64 @@ static void t1320_work_func(struct work_struct *work)
 			int f;
 			__u8 finger_status_reg = 0;
 			__u8 fsr_len = (ts->f11.points_supported + 3) / 4;
-			__u8 finger_status;            
+			__u8 finger_status;
 
-            /* bengin: modify by liyaobing 2011/1/6 */
+			// Gather touch samples
 			for (f = 0; f < ts->f11.points_supported; ++f) {			
-				if (!(f % 4))
-					finger_status_reg = f11_data[f / 4];
-				finger_status = (finger_status_reg >> ((f % 4) * 2)) & 3;
-				prev_status = ts->f11_fingers[f].status;
-				if (!finger_status && prev_status) {
-					ts_update_pen_state(ts, 0, 0, 0, 0, 0); 
-					ts->f11_fingers[f].status = finger_status;
-				#ifdef CONFIG_DEBUG_T1320_FIRMWARE
-					if ( 1 == flag_enable_ta){
-						if (false == flag_last_point){
-							flag_last_point = true ;								
-						}
-			        }
-				#endif
-					continue;
-				} else if (!finger_status && !prev_status) {
-					ts->f11_fingers[f].status = finger_status;
- 				} else {
-					__u8 reg = fsr_len + 5 * f;
-					__u8 *finger_reg = &f11_data[reg];
+				struct f11_finger_data *finger = &ts->f11_fingers[f];
+				__u8 reg = fsr_len + 5 * f;
+				__u8 *finger_reg = &f11_data[reg];
+				
+				if (!(f & 3))
+					finger_status_reg = f11_data[f >> 2];
+				finger_status = (finger_status_reg >> ((f & 3) << 1)) & 3;
 
-					x = (finger_reg[0] * 0x10) | (finger_reg[2] % 0x10);
-					y = (finger_reg[1] * 0x10) | (finger_reg[2] / 0x10);
-					wx = finger_reg[3] % 0x10;
-					wy = finger_reg[3] / 0x10;
-					z = finger_reg[4];
-#ifdef CONFIG_DEBUG_T1320_FIRMWARE
-					ts_debug_X =x ;
-					ts_debug_Y = y ;
-					if(debug_level >= 1)
-						printk("x=%d,y=%d\n",ts_debug_X,ts_debug_Y);
-#endif
-                    ts_update_pen_state(ts, x, y, z, wx, wy);
+				x = (finger_reg[0] << 4) | (finger_reg[2] & 15);
+				y = (finger_reg[1] << 4) | (finger_reg[2] >> 4);
+				wx = finger_reg[3] & 15;
+				wy = finger_reg[3] >> 4;
+				z = finger_reg[4];
 
-#ifdef CONFIG_SYNA_MULTIFINGER
-					/* Report multiple fingers for software prior to 2.6.31 - not standard - uses special input.h */
-					input_report_abs(ts->input_dev, ABS_X_FINGER(f), x);
-					input_report_abs(ts->input_dev, ABS_Y_FINGER(f), y);
-					input_report_abs(ts->input_dev, ABS_Z_FINGER(f), z);
-#endif
-					ts->f11_fingers[f].status = finger_status;
-				}
-            } 
-		if(debug_level >= 3)
-			printk("%s:t1320 work func \n",__func__);
-	            /* end: modify by liyaobing 2011/1/6 */
-                
-				/* f == ts->f11.points_supported */
-				/* set f to offset after all absolute data */
-				f = (f + 3) / 4 + f * 5;
-				if (ts->f11_has_relative) {
-					/* NOTE: not reporting relative data, even if available */
-					/* just skipping over relative data registers */
-					f += 2;
-				}
+				t1320_add_sample(finger, finger_status, x, y, z, wx, wy);
+			}
 
-	            if (ts->hasEgrPalmDetect) {
-	                         	input_report_key(ts->input_dev,
-					                 BTN_DEAD,
-					                 f11_data[f + EGR_PALM_DETECT_REG] & EGR_PALM_DETECT);
-				}
+			t1320_process_touch(ts);
 
-	            if (ts->hasEgrFlick) {
-	                         	if (f11_data[f + EGR_FLICK_REG] & EGR_FLICK) {
-						input_report_rel(ts->input_dev, REL_X, f11_data[f + 2]);
-						input_report_rel(ts->input_dev, REL_Y, f11_data[f + 3]);
-					}
-				}
+			/* f == ts->f11.points_supported */
+			/* set f to offset after all absolute data */
+			f = (f + 3) / 4 + f * 5;
+			if (ts->f11_has_relative) {
+				/* NOTE: not reporting relative data, even if available */
+				/* just skipping over relative data registers */
+				f += 2;
+			}
 
-	            if (ts->hasEgrSingleTap) {
-					input_report_key(ts->input_dev,
-					                 BTN_TOUCH,
-					                 f11_data[f + EGR_SINGLE_TAP_REG] & EGR_SINGLE_TAP);
-				}
+			if (ts->hasEgrPalmDetect) {
+				input_report_key(ts->input_dev,
+						BTN_DEAD,
+						f11_data[f + EGR_PALM_DETECT_REG] & EGR_PALM_DETECT);
+			}
 
-	            if (ts->hasEgrDoubleTap) {
-					input_report_key(ts->input_dev,
-					                 BTN_TOOL_DOUBLETAP,
-					                 f11_data[f + EGR_DOUBLE_TAP_REG] & EGR_DOUBLE_TAP);
+			if (ts->hasEgrFlick) {
+				if (f11_data[f + EGR_FLICK_REG] & EGR_FLICK) {
+					input_report_rel(ts->input_dev, REL_X, f11_data[f + 2]);
+					input_report_rel(ts->input_dev, REL_Y, f11_data[f + 3]);
 				}
-			}            
-            
+			}
+
+			if (ts->hasEgrSingleTap) {
+				input_report_key(ts->input_dev,
+						BTN_TOUCH,
+						f11_data[f + EGR_SINGLE_TAP_REG] & EGR_SINGLE_TAP);
+			}
+
+			if (ts->hasEgrDoubleTap) {
+				input_report_key(ts->input_dev,
+						BTN_TOOL_DOUBLETAP,
+						f11_data[f + EGR_DOUBLE_TAP_REG] & EGR_DOUBLE_TAP);
+			}
+		}            
+
 		if (ts->hasF19 && interrupt[ts->f19.interrupt_offset] & ts->f19.interrupt_mask) {
 			int reg;
 			int touch = 0;
@@ -1398,27 +1483,27 @@ static void t1320_work_func(struct work_struct *work)
 					touch = 1;
 					break;
 				}
-            }
+			}
 			input_report_key(ts->input_dev, BTN_DEAD, touch);
 
 #ifdef  CONFIG_SYNA_BUTTONS
 			t1320_report_buttons(ts->input_dev,
-			                         &ts->data[ts->f19.data_offset],
-                                                 ts->f19.points_supported, BTN_F19);
+					&ts->data[ts->f19.data_offset],
+					ts->f19.points_supported, BTN_F19);
 #endif
 
 #ifdef  CONFIG_SYNA_BUTTONS_SCROLL
 			t1320_report_scroll(ts->input_dev,
-			                        &ts->data[ts->f19.data_offset],
-			                        ts->f19.points_supported,
-			                        SCROLL_ORIENTATION);
+					&ts->data[ts->f19.data_offset],
+					ts->f19.points_supported,
+					SCROLL_ORIENTATION);
 #endif
 		}
 
 		if (ts->hasF30 && interrupt[ts->f30.interrupt_offset] & ts->f30.interrupt_mask) {
 			t1320_report_buttons(ts->input_dev,
-			                         &ts->data[ts->f30.data_offset],
-		                                 ts->f30.points_supported, BTN_F30);
+					&ts->data[ts->f30.data_offset],
+					ts->f30.points_supported, BTN_F30);
 		}
 		input_sync(ts->input_dev);
 #ifdef CONFIG_DEBUG_T1320_FIRMWARE
@@ -1427,7 +1512,7 @@ static void t1320_work_func(struct work_struct *work)
 				getnstimeofday(&time_tp.time_first_end);
 				flag_first_point = false ;								
 			}
-			
+
 			if(true == flag_last_point){
 				getnstimeofday(&time_tp.time_last_end);
 				flag_last_point = false ;	
@@ -1441,19 +1526,19 @@ static void t1320_work_func(struct work_struct *work)
 #endif	
 	}
 
-	  /*if chip report exception detectde power up reset touchscreent*/
-	 if( 0x03 ==  (i2c_smbus_read_byte_data(g_client,update_firmware_addr.f01_t1320_tm1771_data0) & 0x07)){
+	/*if chip report exception detectde power up reset touchscreent*/
+	if( 0x03 ==  (i2c_smbus_read_byte_data(g_client,update_firmware_addr.f01_t1320_tm1771_data0) & 0x07)){
 		if (i2c_smbus_read_byte_data(g_client,update_firmware_addr.f01_t1320_tm1771_data0+1) & 0x02){
 			printk(KERN_ERR "%s: t1320 chip detect exception and will power up reset it\n", __func__);
 			ts->chip_poweron_reset() ; 
 		}
-	 }
-	
-	if (ts->use_irq){
-	t1320_attn_clear(ts);
-	enable_irq(ts->client->irq);
+	}
 
-    }
+	if (ts->use_irq){
+		t1320_attn_clear(ts);
+		enable_irq(ts->client->irq);
+
+	}
 	/*disable power reset after process point report*/
 	power_reset_enable = 1 ;
 	if(debug_level >= 3)
