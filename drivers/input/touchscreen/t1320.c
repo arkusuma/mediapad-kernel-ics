@@ -1250,13 +1250,147 @@ static void t1320_work_reset_func(struct work_struct *work)
 	}
 }
 
+/**
+ * Minimum sample count that should be collected before filtering begin.
+ */
+#define MIN_SAMPLE   5
+
+/**
+ * Maximum sample count that should be kept in history.
+ */
+#define SAMPLE_SIZE 10
+
+#if SAMPLE_SIZE > MAX_SAMPLE
+#error "SAMPLE_SIZE > MAX_SAMPLE"
+#endif
+
+#if MIN_SAMPLE > MAX_SAMPLE
+#error "MIN_SAMPLE > MAX_SAMPLE"
+#endif
+
+/**
+ * MediaPad screen is 1280x800 pixels, and the touchscreen controller
+ * is 3015x1892. So you get 2.365 touchscreen unit for each screen pixel.
+ */
+
+/**
+ * Sampled touches outside FILTER_RADIUS won't be used for filtering,
+ * and will be discarded.
+ */
+#define FILTER_RADIUS 95 /* 40 pixels * 2.365 */
+
+/**
+ * How far should a touch move before it will be considered as a swipe.
+ */
+#define TOUCH_THRES   10 /* 4 pixels * 2.365 */
+
+/**
+ * Minimum distance between swipe.
+ */
+#define SWIPE_THRES    3 /* 1 pixel * 2.365 */
+
+struct my_attribute {
+	struct kobj_attribute attr;
+	int *value;
+	int (*validator)(int);
+};
+
+static ssize_t my_attribute_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf);
+static ssize_t my_attribute_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count);
+
+#define DECL_ATTR(_name, _default, _validator) \
+	static int _name = _default; \
+	static struct my_attribute _name##_attr = { \
+		.attr.attr.name = __stringify(_name), \
+		.attr.attr.mode = 0666, \
+		.attr.show	= my_attribute_show, \
+		.attr.store = my_attribute_store, \
+		.value = &_name, \
+		.validator = _validator, \
+	}
+
+static int is_positive(int val)
+{
+	return val >= 0;
+}
+
+static int is_valid_sample(int val)
+{
+	return val > 0 && val <= MAX_SAMPLE;
+}
+
+DECL_ATTR(filter_radius, FILTER_RADIUS, is_positive);
+DECL_ATTR(touch_thres,   TOUCH_THRES,   is_positive);
+DECL_ATTR(swipe_thres,   SWIPE_THRES,   is_positive);
+DECL_ATTR(sample_size,   SAMPLE_SIZE,   is_valid_sample);
+DECL_ATTR(min_sample,    MIN_SAMPLE,    is_valid_sample);
+
 static inline void reset_finger(struct f11_finger_data *finger)
 {
 	finger->sample_index = 0;
 	finger->sample_count = 0;
+	finger->report_count = 0;
 	finger->x_sum = 0;
 	finger->y_sum = 0;
 	finger->z_sum = 0;
+}
+
+static ssize_t my_attribute_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct my_attribute *my = container_of(attr, struct my_attribute, attr);
+	return sprintf(buf, "%d\n", *my->value);
+}
+
+static ssize_t my_attribute_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct my_attribute *my = container_of(attr, struct my_attribute, attr);
+	struct t1320 *ts = (struct t1320 *) g_client->dev.platform_data;
+	int tmp, f;
+	if (sscanf(buf, "%d", &tmp) != 1 || !my->validator(tmp))
+		return -EINVAL;
+	*my->value = tmp;
+
+	if (min_sample > sample_size)
+		min_sample = sample_size;
+
+	for (f = 0; f < ts->f11.points_supported; ++f) {
+		struct f11_finger_data *finger = &ts->f11_fingers[f];
+		reset_finger(finger);
+	}
+
+	return strnlen(buf, count);
+}
+
+static int init_filter_sysfs(void)
+{
+	int i;
+	struct kobject *kobj;
+	struct my_attribute *attrs[] = {
+		&filter_radius_attr,
+		&touch_thres_attr,
+		&swipe_thres_attr,
+		&sample_size_attr,
+		&min_sample_attr,
+		0
+	};
+ 
+	kobj = kobject_create_and_add("t1320", NULL);
+	if (kobj == NULL) {
+		printk(KERN_ERR "kobject_create_and_add() error");
+		return -1;
+	}
+	for (i = 0; attrs[i]; i++) {
+		if (sysfs_create_file(kobj, &attrs[i]->attr.attr)) {
+			kobject_put(kobj);
+			printk("sysfs_create_file() error");
+			return -1;
+		}
+	}
+	return 0;
 }
 
 static void add_sample(struct f11_finger_data *finger, int status, int x, int y, int z, int wx, int wy)
@@ -1271,16 +1405,17 @@ static void add_sample(struct f11_finger_data *finger, int status, int x, int y,
 
 	finger->status = status;
 	if (status) {
-		int i, dx, dy;
+		int i, dx, dy, dist;
 		// Remove samples outside filter radius
 		while (finger->sample_count > 0) {
 			i = finger->sample_index - finger->sample_count;
 			if (i < 0)
-				i += FILTER_MAX_SAMPLE;
+				i += sample_size;
 
 			dx = x - finger->x[i];
 			dy = y - finger->y[i];
-			if (dx * dx + dy * dy <= FILTER_RADIUS)
+			dist = dx * dx + dy * dy;
+			if (dist <= filter_radius * filter_radius)
 				break;
 
 			finger->x_sum -= finger->x[i];
@@ -1291,8 +1426,8 @@ static void add_sample(struct f11_finger_data *finger, int status, int x, int y,
 		}
 
 		i = finger->sample_index;
-		finger->sample_index = i + 1 < FILTER_MAX_SAMPLE ? i + 1 : 0;
-		if (finger->sample_count < FILTER_MAX_SAMPLE) {
+		finger->sample_index = i + 1 < sample_size ? i + 1 : 0;
+		if (finger->sample_count < sample_size) {
 			finger->sample_count++;
 		} else {
 			finger->x_sum -= finger->x[i];
@@ -1313,11 +1448,17 @@ static void add_sample(struct f11_finger_data *finger, int status, int x, int y,
 		finger->y_avg = finger->y_sum / i;
 		finger->z_avg = finger->z_sum / i;
 
-		if (finger->sample_count >= FILTER_MIN_SAMPLE) {
+		if (finger->sample_count >= min_sample) {
 			dx = finger->x_avg - finger->x_last;
 			dy = finger->y_avg - finger->y_last;
-			if (dx * dx + dy * dy >= FILTER_MIN_MOVE)
-				finger->dirty = 1;
+			dist = dx * dx + dy * dy;
+			if (finger->report_count == 1) {
+				if (dist >= touch_thres * touch_thres)
+					finger->dirty = 1;
+			} else {
+				if (dist >= swipe_thres * swipe_thres)
+					finger->dirty = 1;
+			}
 		}
 	}
 }
@@ -1344,6 +1485,8 @@ static void report_finger(struct t1320 *ts, struct f11_finger_data *finger)
 		finger->x_last = finger->x_avg;
 		finger->y_last = finger->y_avg;
 		finger->z_last = finger->z_avg;
+
+		finger->report_count++;
 	}
 
 #ifdef CONFIG_SYNA_MT
@@ -1831,6 +1974,9 @@ static int t1320_probe(struct i2c_client *client,
 
     g_tm1771_dect_flag = 1;
     /* end: added by liyaobing 00169718 for MMI test 20110105 */
+
+		if (init_filter_sysfs() != 0)
+			goto err_input_register_device_failed;
 
 #ifdef CONFIG_UPDATE_T1320_FIRMWARE  
          ts_firmware_file();
